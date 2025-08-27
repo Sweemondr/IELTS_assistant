@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+GRR/THR Evaluator (overlap-enabled)
+Usage:
+  python grr_thr_evaluator.py --samples /path/to/samples.csv --questions /path/to/questions.csv --alpha 0.6
+Outputs:
+  - samples_split_overlap.csv
+  - per_question_report.csv
+  - overall_summary.csv
+"""
+
+import argparse, pandas as pd, re, numpy as np, json
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+def split_sentences(text):
+    text = re.sub(r'\s+', ' ', str(text)).strip()
+    parts = re.split(r'(?<=[.!?;])\s+', text)
+    return [p.strip() for p in parts if p.strip()]
+
+# 通用故事（作为 general baseline）
+GENERAL_STORY = """One of the most positive and inspiring individuals I have ever known is my university roommate, Li Ming. 
+We've been close friends for four years now, sharing both academic and personal experiences. 
+Li Ming is easily recognizable with his tall stature and his signature blue baseball cap, which he wears almost every day. 
+His personality is a perfect blend of cheerfulness and helpfulness, always ready to lend a hand with a smile. 
+His sense of humor is infectious, often lightening the mood during stressful exam periods.
+
+A particularly memorable event was when we collaborated to organize a charity sale. 
+Li Ming took on the crucial role of organizing volunteers, demonstrating remarkable leadership and organizational skills. 
+Meanwhile, I focused on promoting the event. 
+Together, we successfully raised a significant amount of funds for a local charity. 
+This experience was profoundly positive, not just because of the funds raised, but because it brought out the best in people and strengthened our friendship.
+
+Li Ming’s unwavering optimism and dedication to helping others have significantly influenced me. 
+He has taught me that maintaining a positive outlook and being of service to others are invaluable qualities. 
+His impact on my life is a testament to the power of positivity and altruism, and I am grateful to have him as a friend.
+"""
+
+# 槽位正则（中英文映射）
+SLOT_PATTERNS = {
+    "名称": [r"\b[A-Z][a-z]+(?:\s[A-Z][a-z]+)?\b", r"\bLi\s*Ming\b"],
+    "身份": [r"\b(student|classmate|roommate|colleague|coworker|teacher|professor|friend|family|boss|manager)\b"],
+    "关系": [r"\b(friend|friends|roommate)\b", r"\bwe('ve)?\sbeen\b.*\b(year|years|months)\b", r"\bknown?\b.*\b(for|since)\b"],
+    "外貌": [r"\b(tall|short|slim|glasses|hair|cap|hat|beard|mustache|appearance|looks|wears|wearing)\b", r"\bblue\s+baseball\s+cap\b"],
+    "性格": [r"\b(cheerful|helpful|optimistic|kind|patient|humorous|funny|outgoing|introvert|extrovert|responsible|reliable|hardworking)\b"],
+    "经历": [r"\bwe\s(collaborated|organized|worked)\b", r"\btogether\b", r"\bcharity\b", r"\bproject\b", r"\bevent\b", r"\bsale\b"],
+    "感受": [r"\bI\s(feel|felt|realize|realized|learned|think)\b", r"\b(influenc|inspired|taught|grateful|impressed)\b", r"\bmade me\b"]
+}
+
+def canonicalize_slot(ch):
+    if any(k in ch for k in ["名称","名字"]): return "名称"
+    if "身份" in ch: return "身份"
+    if "关系" in ch: return "关系"
+    if any(k in ch for k in ["外貌","外观"]): return "外貌"
+    if any(k in ch for k in ["性格","特点"]): return "性格"
+    if any(k in ch for k in ["经历","事件"]): return "经历"
+    if any(k in ch for k in ["感受","评价","印象"]): return "感受"
+    return None
+
+def pick_answer_col(df):
+    cands = [c for c in df.columns if c.lower() in ["answer","generated_answer","output","text","response","content","answer_text"]]
+    if cands: return cands[0]
+    def avg_len(col):
+        vals = df[col].dropna().astype(str).tolist()
+        return sum(len(x) for x in vals)/max(len(vals),1)
+    return sorted(df.columns, key=avg_len, reverse=True)[0]
+
+def compute_grr_per_question(df, reuse_thr=0.75):
+    recs = []
+    for _, rr in df.iterrows():
+        qid = rr["question_id"]
+        for s in split_sentences(rr.get("general_answer","")):
+            recs.append((qid, s))
+    if not recs: return 0.0, {}
+    texts = [s for _, s in recs]
+    vec2 = TfidfVectorizer(lowercase=True, stop_words="english")
+    X2 = vec2.fit_transform(texts)
+    sims2 = cosine_similarity(X2)
+    qids = [qid for qid,_ in recs]
+    reused_flags = [False]*len(recs)
+    for i in range(len(recs)):
+        qi = qids[i]
+        for j in range(len(recs)):
+            if i==j: continue
+            if qids[j]!=qi and sims2[i,j] >= reuse_thr:
+                reused_flags[i] = True; break
+    from collections import defaultdict
+    tot, hit = defaultdict(int), defaultdict(int)
+    for (qid,_), flag in zip(recs, reused_flags):
+        tot[qid]+=1; hit[qid]+=int(flag)
+    per_q = {q: (hit[q]/tot[q] if tot[q]>0 else 0.0) for q in tot}
+    global_grr = sum(reused_flags)/max(len(reused_flags),1)
+    return global_grr, per_q
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--samples", required=True)
+    parser.add_argument("--questions", required=True)
+    parser.add_argument("--alpha", type=float, default=0.6)
+    args = parser.parse_args()
+
+    samples = pd.read_csv(args.samples)
+    questions = pd.read_csv(args.questions)
+
+    general_sents = split_sentences(GENERAL_STORY)
+    vect = TfidfVectorizer(lowercase=True, stop_words="english", min_df=1)
+    G = vect.fit_transform(general_sents)
+    SIM_THR = 0.5
+
+    ans_col = pick_answer_col(samples)
+
+    rows = []
+    for _, r in samples.iterrows():
+        ans = str(r.get(ans_col, ""))
+        sents = split_sentences(ans)
+        A = vect.transform(sents) if sents else None
+        sims = cosine_similarity(A, G) if sents else np.zeros((0, len(general_sents)))
+        max_sim = sims.max(axis=1) if sims.size else np.array([])
+
+        qid = r["question_id"]
+        qrow = questions[questions["question_id"]==qid]
+        canon_slots = []
+        if not qrow.empty:
+            raw = str(qrow.iloc[0]["required_slots"])
